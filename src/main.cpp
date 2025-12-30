@@ -1,0 +1,599 @@
+#include <arpa/inet.h>
+#include <errno.h>
+#include <infiniband/verbs.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <array>
+#include <chrono>
+#include <cinttypes>
+#include <cstring>
+#include <functional>
+#include <iostream>
+#include <memory>
+#include <optional>
+#include <random>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+struct Options {
+  std::string rdma_device = "mlx5_0";
+  uint8_t rdma_port = 1;
+  uint8_t gid_index = 0;
+  std::string next_host;
+  uint16_t oob_port = 18515;
+  int rank = 0;
+  int ranks = 1;
+  size_t chunk_bytes = 128ull * 1024ull * 1024ull;
+  int chunk_count = 7;
+  int compute_delay_us = 1;
+  bool uniform_priority = false;  // when true, use default priority for all QPs
+};
+
+struct WireInfo {
+  uint32_t qp_num[7];
+  uint32_t psn[7];
+  uint32_t rkey;
+  uint64_t addr;
+  uint16_t lid;
+  uint8_t gid[16];
+};
+
+struct RemoteQp {
+  uint32_t qp_num = 0;
+  uint32_t psn = 0;
+  uint16_t lid = 0;
+  uint8_t gid[16] = {};
+  uint32_t rkey = 0;
+  uint64_t addr = 0;
+};
+
+struct RdmaResources {
+  ibv_context *ctx = nullptr;
+  ibv_pd *pd = nullptr;
+  ibv_cq *cq = nullptr;
+  ibv_mr *mr = nullptr;
+  void *buf = nullptr;
+};
+
+std::string FormatGid(const ibv_gid &gid) {
+  char buf[40];
+  std::snprintf(buf, sizeof(buf), "%08x%08x%08x%08x", ntohl(gid.global.subnet_prefix >> 32),
+                ntohl(static_cast<uint32_t>(gid.global.subnet_prefix & 0xffffffff)),
+                ntohl(gid.global.interface_id >> 32), ntohl(static_cast<uint32_t>(gid.global.interface_id & 0xffffffff)));
+  return std::string(buf);
+}
+
+void PostRecvs(const std::array<ibv_qp *, 7> &qps, const RdmaResources &res, const Options &opts) {
+  // Post receives so WRITE_WITH_IMM completions have WQEs to land on.
+  for (int prio = 0; prio < 7; ++prio) {
+    for (int i = 0; i < opts.chunk_count; ++i) {
+      ibv_sge sge{};
+      sge.addr = reinterpret_cast<uint64_t>(res.buf);
+      sge.length = 4;
+      sge.lkey = res.mr->lkey;
+      ibv_recv_wr wr{};
+      wr.wr_id = (static_cast<uint64_t>(prio) << 32) | static_cast<uint32_t>(i);
+      wr.sg_list = &sge;
+      wr.num_sge = 1;
+      ibv_recv_wr *bad = nullptr;
+      if (ibv_post_recv(qps[prio], &wr, &bad) != 0) {
+        throw std::runtime_error("ibv_post_recv failed for prio " + std::to_string(prio));
+      }
+    }
+  }
+}
+
+bool SendAll(int fd, const void *buf, size_t len) {
+  const uint8_t *p = static_cast<const uint8_t *>(buf);
+  size_t sent = 0;
+  while (sent < len) {
+    ssize_t rc = ::send(fd, p + sent, len - sent, 0);
+    if (rc <= 0) {
+      if (errno == EINTR) continue;
+      return false;
+    }
+    sent += static_cast<size_t>(rc);
+  }
+  return true;
+}
+
+bool RecvAll(int fd, void *buf, size_t len) {
+  uint8_t *p = static_cast<uint8_t *>(buf);
+  size_t recvd = 0;
+  while (recvd < len) {
+    ssize_t rc = ::recv(fd, p + recvd, len - recvd, MSG_WAITALL);
+    if (rc <= 0) {
+      if (errno == EINTR) continue;
+      return false;
+    }
+    recvd += static_cast<size_t>(rc);
+  }
+  return true;
+}
+
+int Listen(uint16_t port) {
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) throw std::runtime_error("socket() failed");
+  int opt = 1;
+  ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = INADDR_ANY;
+  addr.sin_port = htons(port);
+  if (::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+    ::close(fd);
+    throw std::runtime_error("bind() failed");
+  }
+  if (::listen(fd, 1) < 0) {
+    ::close(fd);
+    throw std::runtime_error("listen() failed");
+  }
+  return fd;
+}
+
+int AcceptOne(int listen_fd) {
+  sockaddr_in peer{};
+  socklen_t len = sizeof(peer);
+  int fd = ::accept(listen_fd, reinterpret_cast<sockaddr *>(&peer), &len);
+  if (fd < 0) throw std::runtime_error("accept() failed");
+  return fd;
+}
+
+int ConnectWithRetry(const std::string &host, uint16_t port, int attempts, int backoff_ms) {
+  addrinfo hints{};
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  addrinfo *res = nullptr;
+  const std::string port_str = std::to_string(port);
+  int rc = ::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res);
+  if (rc != 0) throw std::runtime_error("getaddrinfo failed for " + host);
+
+  for (int i = 0; i < attempts; ++i) {
+    for (addrinfo *p = res; p != nullptr; p = p->ai_next) {
+      int fd = ::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+      if (fd < 0) continue;
+      if (::connect(fd, p->ai_addr, p->ai_addrlen) == 0) {
+        ::freeaddrinfo(res);
+        return fd;
+      }
+      ::close(fd);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+  }
+  ::freeaddrinfo(res);
+  throw std::runtime_error("connect() retries exhausted for " + host);
+}
+
+uint32_t FixedPsn(int priority, int salt) {
+  return static_cast<uint32_t>(0x12345 + (priority * 17) + salt);
+}
+
+uint8_t PriorityForIndex(int idx, const Options &opts) {
+  return opts.uniform_priority ? 0 : static_cast<uint8_t>(idx);
+}
+
+uint8_t DscpForPriority(uint8_t prio) {
+  // Default DSCP mapping aligned to the provided switch dscp->tc table.
+  // prio 0..6 -> DSCP {10,0,16,24,32,40,48} -> TC {0,1,2,3,4,5,6}.
+  static const uint8_t kMap[7] = {10, 0, 16, 24, 32, 40, 48};
+  return kMap[prio % 7];
+}
+
+void ParseArgs(int argc, char **argv, Options *opts) {
+  for (int i = 1; i < argc; ++i) {
+    std::string arg(argv[i]);
+    auto next_val = [&](const char *flag) -> std::string {
+      if (i + 1 >= argc) throw std::runtime_error(std::string("missing value for ") + flag);
+      return std::string(argv[++i]);
+    };
+    if (arg == "--rdma-device") {
+      opts->rdma_device = next_val("--rdma-device");
+    } else if (arg == "--rdma-port") {
+      opts->rdma_port = static_cast<uint8_t>(std::stoi(next_val("--rdma-port")));
+    } else if (arg == "--gid-index") {
+      opts->gid_index = static_cast<uint8_t>(std::stoi(next_val("--gid-index")));
+    } else if (arg == "--next-host") {
+      opts->next_host = next_val("--next-host");
+    } else if (arg == "--oob-port") {
+      opts->oob_port = static_cast<uint16_t>(std::stoi(next_val("--oob-port")));
+    } else if (arg == "--rank") {
+      opts->rank = std::stoi(next_val("--rank"));
+    } else if (arg == "--ranks") {
+      opts->ranks = std::stoi(next_val("--ranks"));
+    } else if (arg == "--chunk-bytes") {
+      opts->chunk_bytes = static_cast<size_t>(std::stoull(next_val("--chunk-bytes")));
+    } else if (arg == "--chunk-count") {
+      opts->chunk_count = std::stoi(next_val("--chunk-count"));
+    } else if (arg == "--compute-delay-us") {
+      opts->compute_delay_us = std::stoi(next_val("--compute-delay-us"));
+    } else if (arg == "--uniform-priority") {
+      opts->uniform_priority = true;
+    } else if (arg == "--help") {
+      throw std::runtime_error("help");
+    } else {
+      throw std::runtime_error("unknown arg: " + arg);
+    }
+  }
+  if (opts->next_host.empty()) throw std::runtime_error("missing --next-host");
+}
+
+ibv_device *FindDevice(const std::string &name) {
+  int num = 0;
+  ibv_device **list = ibv_get_device_list(&num);
+  if (!list) throw std::runtime_error("ibv_get_device_list failed");
+  ibv_device *found = nullptr;
+  for (int i = 0; i < num; ++i) {
+    if (name == ibv_get_device_name(list[i])) {
+      found = list[i];
+      break;
+    }
+  }
+  ibv_free_device_list(list);
+  if (!found) throw std::runtime_error("rdma device not found: " + name);
+  return found;
+}
+
+RdmaResources InitRdma(const Options &opts) {
+  RdmaResources res{};
+  ibv_device *dev = FindDevice(opts.rdma_device);
+  res.ctx = ibv_open_device(dev);
+  if (!res.ctx) throw std::runtime_error("ibv_open_device failed");
+
+  ibv_port_attr port_attr{};
+  if (ibv_query_port(res.ctx, opts.rdma_port, &port_attr) != 0) {
+    throw std::runtime_error("ibv_query_port failed");
+  }
+  res.pd = ibv_alloc_pd(res.ctx);
+  if (!res.pd) throw std::runtime_error("ibv_alloc_pd failed");
+
+  const size_t buf_len = opts.chunk_bytes * static_cast<size_t>(opts.chunk_count);
+  constexpr size_t kPageAlign = 4096;
+  if (posix_memalign(&res.buf, kPageAlign, buf_len) != 0) {
+    throw std::runtime_error("posix_memalign failed");
+  }
+  std::memset(res.buf, 0, buf_len);
+  res.mr = ibv_reg_mr(res.pd, res.buf, buf_len,
+                      IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+  if (!res.mr) throw std::runtime_error("ibv_reg_mr failed");
+
+  const int cq_depth = opts.chunk_count * 4 + 32;
+  res.cq = ibv_create_cq(res.ctx, cq_depth, nullptr, nullptr, 0);
+  if (!res.cq) throw std::runtime_error("ibv_create_cq failed");
+
+  return res;
+}
+
+ibv_qp *CreatePriorityQp(ibv_pd *pd, ibv_cq *cq, uint8_t port, uint8_t priority) {
+  ibv_qp_init_attr init{};
+  init.qp_type = IBV_QPT_RC;
+  init.send_cq = cq;
+  init.recv_cq = cq;
+  init.cap.max_send_wr = 128;
+  init.cap.max_recv_wr = 64;  // we will pre-post receives for immediate notifications
+  init.cap.max_send_sge = 1;
+  init.cap.max_recv_sge = 1;
+  init.sq_sig_all = 0;
+
+  ibv_qp *qp = ibv_create_qp(pd, &init);
+  if (!qp) throw std::runtime_error("ibv_create_qp failed");
+
+  ibv_qp_attr attr{};
+  attr.qp_state = IBV_QPS_INIT;
+  attr.pkey_index = 0;
+  attr.port_num = port;
+  attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_WRITE;
+  attr.ah_attr.is_global = 0;
+  attr.ah_attr.sl = priority;
+  int flags = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS;
+  if (ibv_modify_qp(qp, &attr, flags) != 0) {
+    throw std::runtime_error("ibv_modify_qp INIT failed");
+  }
+  return qp;
+}
+
+bool MoveToRtr(ibv_qp *qp, const RemoteQp &remote, uint8_t port, uint8_t priority, bool use_gid, uint8_t path_mtu,
+               uint8_t sgid_index) {
+  ibv_qp_attr attr{};
+  attr.qp_state = IBV_QPS_RTR;
+  attr.path_mtu = static_cast<ibv_mtu>(path_mtu);
+  attr.dest_qp_num = remote.qp_num;
+  attr.rq_psn = remote.psn;
+  attr.max_dest_rd_atomic = 1;
+  attr.min_rnr_timer = 12;
+  attr.ah_attr.is_global = use_gid ? 1 : 0;
+  attr.ah_attr.dlid = use_gid ? 0 : remote.lid;
+  attr.ah_attr.sl = priority;
+  attr.ah_attr.src_path_bits = 0;
+  attr.ah_attr.port_num = port;
+  if (use_gid) {
+    attr.ah_attr.grh.dgid = *reinterpret_cast<const ibv_gid *>(remote.gid);
+    attr.ah_attr.grh.sgid_index = sgid_index;
+    attr.ah_attr.grh.hop_limit = 64;
+    const uint8_t dscp = DscpForPriority(priority);
+    attr.ah_attr.grh.traffic_class = static_cast<uint8_t>(dscp << 2);  // DSCP in upper 6 bits.
+  }
+  int flags = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
+              IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
+  return ibv_modify_qp(qp, &attr, flags) == 0;
+}
+
+bool MoveToRts(ibv_qp *qp, uint32_t psn) {
+  ibv_qp_attr attr{};
+  attr.qp_state = IBV_QPS_RTS;
+  attr.timeout = 14;
+  attr.retry_cnt = 7;
+  attr.rnr_retry = 7;
+  attr.sq_psn = psn;
+  attr.max_rd_atomic = 1;
+  int flags = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
+              IBV_QP_MAX_QP_RD_ATOMIC;
+  return ibv_modify_qp(qp, &attr, flags) == 0;
+}
+
+WireInfo BuildWire(const std::array<ibv_qp *, 7> &qps, const RdmaResources &res,
+                   const std::array<uint32_t, 7> &psn, uint16_t lid, const ibv_gid &gid) {
+  WireInfo info{};
+  for (int i = 0; i < 7; ++i) {
+    info.qp_num[i] = qps[i]->qp_num;
+    info.psn[i] = psn[i];
+  }
+  info.rkey = res.mr->rkey;
+  info.addr = reinterpret_cast<uint64_t>(res.buf);
+  info.lid = lid;
+  std::memcpy(info.gid, gid.raw, sizeof(info.gid));
+  return info;
+}
+
+void BringUpSide(const std::array<ibv_qp *, 7> &local_qps, const WireInfo &remote_info,
+                 const std::array<uint32_t, 7> &local_psn, bool use_gid, uint8_t port, uint8_t path_mtu,
+                 const Options &opts) {
+  for (int i = 0; i < 7; ++i) {
+    RemoteQp remote{};
+    remote.qp_num = remote_info.qp_num[i];
+    remote.psn = remote_info.psn[i];
+    remote.lid = remote_info.lid;
+    std::memcpy(remote.gid, remote_info.gid, sizeof(remote.gid));
+    const uint8_t prio = PriorityForIndex(i, opts);
+    if (!MoveToRtr(local_qps[i], remote, port, prio, use_gid, path_mtu, opts.gid_index)) {
+      throw std::runtime_error("MoveToRtr failed for priority " + std::to_string(i));
+    }
+    if (!MoveToRts(local_qps[i], local_psn[i])) {
+      throw std::runtime_error("MoveToRts failed for priority " + std::to_string(i));
+    }
+  }
+}
+
+}  // namespace
+
+int main(int argc, char **argv) {
+  try {
+    Options opts;
+    try {
+      ParseArgs(argc, argv, &opts);
+    } catch (const std::runtime_error &e) {
+      std::cerr << "Usage: " << argv[0]
+                << " --next-host <host> [--oob-port 18515] [--rdma-device mlx5_0] [--rdma-port 1] "
+                   "[--gid-index 0] [--rank 0] [--ranks 2] [--chunk-bytes 134217728] [--chunk-count 7] "
+                   "[--compute-delay-us 1] [--uniform-priority]\n";
+      return e.what() == std::string("help") ? 0 : 1;
+    }
+
+    RdmaResources res = InitRdma(opts);
+    ibv_port_attr port_attr{};
+    if (ibv_query_port(res.ctx, opts.rdma_port, &port_attr) != 0) {
+      throw std::runtime_error("ibv_query_port failed after init");
+    }
+    ibv_gid gid{};
+    if (ibv_query_gid(res.ctx, opts.rdma_port, opts.gid_index, &gid) != 0) {
+      throw std::runtime_error("ibv_query_gid failed");
+    }
+    const bool use_gid = port_attr.link_layer == IBV_LINK_LAYER_ETHERNET;
+    const uint8_t path_mtu = static_cast<uint8_t>(port_attr.active_mtu);
+
+    std::array<ibv_qp *, 7> qps_rx{};
+    std::array<ibv_qp *, 7> qps_tx{};
+    std::array<uint32_t, 7> psn_rx{};
+    std::array<uint32_t, 7> psn_tx{};
+    for (int i = 0; i < 7; ++i) {
+      const uint8_t prio = PriorityForIndex(i, opts);
+      qps_rx[i] = CreatePriorityQp(res.pd, res.cq, opts.rdma_port, prio);
+      qps_tx[i] = CreatePriorityQp(res.pd, res.cq, opts.rdma_port, prio);
+      psn_rx[i] = FixedPsn(i, 0);
+      psn_tx[i] = FixedPsn(i, 100);
+    }
+
+    WireInfo local_rx = BuildWire(qps_rx, res, psn_rx, port_attr.lid, gid);
+    WireInfo local_tx = BuildWire(qps_tx, res, psn_tx, port_attr.lid, gid);
+
+    // Accept control channel from previous rank.
+    int listen_fd = Listen(opts.oob_port);
+    std::optional<WireInfo> from_prev;
+    std::thread accept_thread([&]() {
+      int fd = AcceptOne(listen_fd);
+      WireInfo incoming{};
+      if (!RecvAll(fd, &incoming, sizeof(incoming))) {
+        std::cerr << "Failed to receive from previous\n";
+        ::close(fd);
+        return;
+      }
+      if (!SendAll(fd, &local_rx, sizeof(local_rx))) {
+        std::cerr << "Failed to send to previous\n";
+        ::close(fd);
+        return;
+      }
+      ::close(fd);
+      from_prev = incoming;
+    });
+
+    // Connect to next rank.
+    WireInfo from_next{};
+    {
+      int fd = ConnectWithRetry(opts.next_host, opts.oob_port, 50, 200);
+      if (!SendAll(fd, &local_tx, sizeof(local_tx))) {
+        throw std::runtime_error("send to next failed");
+      }
+      if (!RecvAll(fd, &from_next, sizeof(from_next))) {
+        throw std::runtime_error("recv from next failed");
+      }
+      ::close(fd);
+    }
+
+    accept_thread.join();
+    if (!from_prev) throw std::runtime_error("did not receive handshake from previous rank");
+
+    BringUpSide(qps_tx, from_next, psn_tx, use_gid, opts.rdma_port, path_mtu, opts);
+    BringUpSide(qps_rx, *from_prev, psn_rx, use_gid, opts.rdma_port, path_mtu, opts);
+
+    PostRecvs(qps_rx, res, opts);
+
+    std::cout << "RDMA control plane ready.\n";
+    std::cout << "Device=" << opts.rdma_device << " port=" << static_cast<int>(opts.rdma_port)
+              << " gid_index=" << static_cast<int>(opts.gid_index) << " gid=" << FormatGid(gid)
+              << " active_mtu=" << static_cast<int>(port_attr.active_mtu) << "\n";
+    std::cout << "chunk_bytes=" << opts.chunk_bytes << " chunk_count=" << opts.chunk_count
+              << " compute_delay_us=" << opts.compute_delay_us << " uniform_priority=" << opts.uniform_priority
+              << "\n";
+    std::cout << "Next host=" << opts.next_host << " OOB port=" << opts.oob_port << "\n";
+    std::cout << "QPs up for priorities 0-6 (tx to next and rx from prev).\n";
+    if (use_gid) {
+      std::cout << "DSCP mapping (prio->dscp): ";
+      for (int i = 0; i < 7; ++i) {
+        const uint8_t prio = PriorityForIndex(i, opts);
+        std::cout << i << "->" << static_cast<int>(DscpForPriority(prio)) << (i == 6 ? "" : " ");
+      }
+      std::cout << "\n";
+    }
+
+    const int total_chunks = opts.chunk_count;
+    std::vector<std::chrono::steady_clock::time_point> send_ts(total_chunks);
+    std::vector<std::chrono::steady_clock::time_point> recv_ts(total_chunks);
+    std::vector<bool> send_set(total_chunks, false);
+    std::vector<bool> recv_set(total_chunks, false);
+
+    auto start = std::chrono::steady_clock::now();
+
+    auto post_chunk = [&](int chunk_idx) {
+      const int prio_idx = chunk_idx % 7;
+      ibv_qp *qp = qps_tx[prio_idx];
+      const uint64_t offset = static_cast<uint64_t>(opts.chunk_bytes) * static_cast<uint64_t>(chunk_idx);
+      ibv_sge sge{};
+      sge.addr = reinterpret_cast<uint64_t>(res.buf) + offset;
+      sge.length = static_cast<uint32_t>(opts.chunk_bytes);
+      sge.lkey = res.mr->lkey;
+
+      ibv_send_wr wr_write{};
+      wr_write.wr_id = (static_cast<uint64_t>(chunk_idx) << 32) | 0x1;
+      wr_write.next = nullptr;
+      wr_write.sg_list = &sge;
+      wr_write.num_sge = 1;
+      wr_write.opcode = IBV_WR_RDMA_WRITE;
+      wr_write.send_flags = IBV_SEND_SIGNALED;
+      wr_write.wr.rdma.remote_addr = from_next.addr + offset;
+      wr_write.wr.rdma.rkey = from_next.rkey;
+
+      ibv_send_wr wr_imm{};
+      wr_imm.wr_id = (static_cast<uint64_t>(chunk_idx) << 32) | 0x2;
+      wr_imm.sg_list = &sge;
+      wr_imm.num_sge = 1;
+      wr_imm.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+      wr_imm.send_flags = IBV_SEND_SIGNALED;
+      wr_imm.imm_data = htonl(static_cast<uint32_t>(chunk_idx));
+      wr_imm.wr.rdma.remote_addr = from_next.addr + offset;
+      wr_imm.wr.rdma.rkey = from_next.rkey;
+
+      wr_write.next = &wr_imm;
+      ibv_send_wr *bad = nullptr;
+      if (ibv_post_send(qp, &wr_write, &bad) != 0) {
+        throw std::runtime_error("ibv_post_send failed for chunk " + std::to_string(chunk_idx));
+      }
+      send_ts[chunk_idx] = std::chrono::steady_clock::now();
+      send_set[chunk_idx] = true;
+      std::cout << "Posted chunk " << chunk_idx << " on prio_idx=" << prio_idx
+                << " offset=" << offset << " size=" << opts.chunk_bytes << " (write + write_imm)\n";
+    };
+
+    int sent_chunks = 0;
+    int processed_chunks = 0;
+    int next_to_send = 1;
+    int next_expected = 0;
+
+    auto try_progress = [&]() {
+      while (next_expected < total_chunks && recv_set[next_expected]) {
+        std::this_thread::sleep_for(std::chrono::microseconds(opts.compute_delay_us));
+        if (next_to_send == next_expected + 1 && next_to_send < total_chunks) {
+          post_chunk(next_to_send);
+          ++sent_chunks;
+          ++next_to_send;
+        }
+        ++processed_chunks;
+        ++next_expected;
+      }
+    };
+
+    // Kick off the first chunk immediately.
+    post_chunk(0);
+    sent_chunks = 1;
+
+    const int expected_send_cqes = total_chunks * 2;  // write + write_imm per chunk.
+    int send_cqes = 0;
+
+    std::array<ibv_wc, 16> wcs{};
+    while (processed_chunks < total_chunks || send_cqes < expected_send_cqes) {
+      int n = ibv_poll_cq(res.cq, static_cast<int>(wcs.size()), wcs.data());
+      if (n < 0) {
+        throw std::runtime_error("ibv_poll_cq failed");
+      }
+      for (int i = 0; i < n; ++i) {
+        ibv_wc &wc = wcs[i];
+        if (wc.status != IBV_WC_SUCCESS) {
+          std::cerr << "CQ error: status=" << wc.status << " vendor_err=0x" << std::hex << wc.vendor_err
+                    << " opcode=" << wc.opcode << " wr_id=0x" << wc.wr_id << std::dec << "\n";
+          throw std::runtime_error("CQ error status " + std::to_string(wc.status));
+        }
+        std::cout << "CQE status=" << wc.status << " opcode=" << wc.opcode << " wr_id=0x" << std::hex << wc.wr_id
+                  << " flags=0x" << wc.wc_flags << std::dec;
+        if (wc.wc_flags & IBV_WC_WITH_IMM) {
+          std::cout << " imm=" << ntohl(wc.imm_data);
+        }
+        std::cout << "\n";
+        if (wc.opcode == IBV_WC_SEND || wc.opcode == IBV_WC_RDMA_WRITE) {
+          ++send_cqes;
+          continue;
+        }
+        if (wc.wc_flags & IBV_WC_WITH_IMM) {
+          const uint32_t chunk_idx = ntohl(wc.imm_data);
+          if (chunk_idx < static_cast<uint32_t>(total_chunks)) {
+            std::cout << "CQ recv imm for chunk " << chunk_idx << " wr_id=0x" << std::hex << wc.wr_id
+                      << " opcode=" << wc.opcode << std::dec << "\n";
+            if (!recv_set[chunk_idx]) {
+              recv_ts[chunk_idx] = std::chrono::steady_clock::now();
+              recv_set[chunk_idx] = true;
+            }
+            try_progress();
+          }
+        }
+      }
+    }
+
+    auto end = std::chrono::steady_clock::now();
+    double total_ms = std::chrono::duration<double, std::milli>(end - start).count();
+    std::cout << "Completed " << total_chunks << " chunks. Total time (ms): " << total_ms << "\n";
+    for (int i = 0; i < total_chunks; ++i) {
+      double send_ms = send_set[i] ? std::chrono::duration<double, std::milli>(send_ts[i] - start).count() : -1.0;
+      double recv_ms = recv_set[i] ? std::chrono::duration<double, std::milli>(recv_ts[i] - start).count() : -1.0;
+      std::cout << "Chunk " << i << " send_ms=" << send_ms << " recv_ms=" << recv_ms << "\n";
+    }
+    return 0;
+  } catch (const std::exception &e) {
+    std::cerr << "Error: " << e.what() << "\n";
+    return 1;
+  }
+}

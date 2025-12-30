@@ -1,0 +1,36 @@
+# Host and run configuration for the RDMA priority ring testbed.
+# Adjust hostnames and SSH users as needed; defaults assume two-host ring.
+
+hosts:
+  - name: nf-server101
+    ssh_host: nf-server101
+    ssh_user: jw2282
+    ssh_port: 22
+    rdma_device: mlx5_0
+    rdma_port: 1
+    workdir: /home/jw2282/storm-testbed
+  - name: nf-server102
+    ssh_host: nf-server102
+    ssh_user: jw2282
+    ssh_port: 22
+    rdma_device: mlx5_0   # NIC name; run `ibv_devinfo -l` to verify
+    rdma_port: 1
+    workdir: /home/jw2282/storm-testbed
+
+run:
+  total_ranks: 2          # one rank per host
+  priority_levels: 7
+  # chunk_bytes: 4096  # 4 KB
+  # chunk_bytes: 1048576  # 1 MB
+  chunk_bytes: 16777216  # 16 MB
+  # chunk_bytes: 134217728  # 128 MB
+  chunk_count: 7
+  compute_delay_us: 1
+  iterations: 1
+  results_dir: /tmp/rdma-prio
+  gid_index: 3
+
+# Notes:
+# - Rank i sends to (i+1) % N and receives from (i-1+N) % N.
+# - Priority 0 is highest; we will map priority index to SL/traffic class.
+# - Avoid rdma-cm; use verbs with an out-of-band TCP control channel to exchange QP/rkey/addrs.
