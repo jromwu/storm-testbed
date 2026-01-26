@@ -3,16 +3,22 @@
 #include <infiniband/verbs.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <pthread.h>
+#include <sched.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <random>
@@ -22,6 +28,8 @@
 #include <vector>
 
 namespace {
+
+enum class TimingSource { kCycles, kSteady };
 
 struct Options {
   std::string rdma_device = "mlx5_0";
@@ -35,6 +43,10 @@ struct Options {
   int chunk_count = 7;
   int compute_delay_us = 1;
   bool uniform_priority = false;  // when true, use default priority for all QPs
+  int cpu_affinity = -1;
+  bool verbose = false;
+  TimingSource timing = TimingSource::kCycles;
+  double cpu_mhz = 0.0;
 };
 
 struct WireInfo {
@@ -61,6 +73,9 @@ struct RdmaResources {
   ibv_cq *cq = nullptr;
   ibv_mr *mr = nullptr;
   void *buf = nullptr;
+  uint64_t max_mr_size = 0;
+  uint32_t max_qp_wr = 0;
+  uint32_t max_cqe = 0;
 };
 
 std::string FormatGid(const ibv_gid &gid) {
@@ -69,6 +84,89 @@ std::string FormatGid(const ibv_gid &gid) {
                 ntohl(static_cast<uint32_t>(gid.global.subnet_prefix & 0xffffffff)),
                 ntohl(gid.global.interface_id >> 32), ntohl(static_cast<uint32_t>(gid.global.interface_id & 0xffffffff)));
   return std::string(buf);
+}
+
+#if defined(__x86_64__) || defined(__i386__)
+using cycles_t = unsigned long long;
+inline cycles_t GetCycles() {
+  unsigned low, high;
+  asm volatile("rdtsc" : "=a"(low), "=d"(high));
+  return (static_cast<cycles_t>(high) << 32) | low;
+}
+constexpr bool kHasCycles = true;
+#else
+using cycles_t = unsigned long long;
+inline cycles_t GetCycles() { return 0; }
+constexpr bool kHasCycles = false;
+#endif
+
+std::optional<double> ReadCpuMhzFromCpuinfo() {
+  std::ifstream file("/proc/cpuinfo");
+  if (!file) return std::nullopt;
+  std::string line;
+  while (std::getline(file, line)) {
+    if (line.find("cpu MHz") == std::string::npos) continue;
+    const auto pos = line.find(':');
+    if (pos == std::string::npos) continue;
+    const char *start = line.c_str() + pos + 1;
+    char *end = nullptr;
+    double val = std::strtod(start, &end);
+    if (end != start) {
+      return val;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<double> ReadCpuMhzFromSysfs(const char *path) {
+  std::ifstream file(path);
+  if (!file) return std::nullopt;
+  double khz = 0.0;
+  if (!(file >> khz)) return std::nullopt;
+  return khz / 1000.0;
+}
+
+double DetectCpuMhz() {
+  if (auto mhz = ReadCpuMhzFromSysfs("/sys/devices/system/cpu/cpu0/tsc_freq_khz")) return *mhz;
+  if (auto mhz = ReadCpuMhzFromSysfs("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")) return *mhz;
+  if (auto mhz = ReadCpuMhzFromCpuinfo()) return *mhz;
+  return 0.0;
+}
+
+struct Timer {
+  TimingSource source = TimingSource::kSteady;
+  double ticks_per_ms = 1e6;
+  cycles_t start_cycles = 0;
+  std::chrono::steady_clock::time_point start_time{};
+  double cpu_mhz = 0.0;
+
+  uint64_t Now() const {
+    if (source == TimingSource::kCycles) {
+      return static_cast<uint64_t>(GetCycles() - start_cycles);
+    }
+    auto delta = std::chrono::steady_clock::now() - start_time;
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(delta).count());
+  }
+};
+
+Timer InitTimer(const Options &opts) {
+  Timer timer;
+  timer.source = opts.timing;
+  if (opts.timing == TimingSource::kCycles) {
+    if (!kHasCycles) {
+      throw std::runtime_error("cycle counter timing not supported on this architecture");
+    }
+    timer.cpu_mhz = opts.cpu_mhz > 0.0 ? opts.cpu_mhz : DetectCpuMhz();
+    if (timer.cpu_mhz <= 0.0) {
+      throw std::runtime_error("failed to detect CPU MHz; pass --cpu-mhz");
+    }
+    timer.ticks_per_ms = timer.cpu_mhz * 1000.0;
+    timer.start_cycles = GetCycles();
+  } else {
+    timer.ticks_per_ms = 1e6;
+    timer.start_time = std::chrono::steady_clock::now();
+  }
+  return timer;
 }
 
 void PostRecvs(const std::array<ibv_qp *, 7> &qps, const RdmaResources &res, const Options &opts) {
@@ -187,6 +285,20 @@ uint8_t DscpForPriority(uint8_t prio) {
   return kMap[prio % 7];
 }
 
+bool PinThreadToCpu(int cpu, const char *label) {
+  if (cpu < 0) return true;
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+  CPU_SET(cpu, &cpuset);
+  int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+  if (rc != 0) {
+    std::cerr << "Failed to set CPU affinity for " << label << " to CPU " << cpu << ": "
+              << std::strerror(rc) << "\n";
+    return false;
+  }
+  return true;
+}
+
 void ParseArgs(int argc, char **argv, Options *opts) {
   for (int i = 1; i < argc; ++i) {
     std::string arg(argv[i]);
@@ -216,6 +328,21 @@ void ParseArgs(int argc, char **argv, Options *opts) {
       opts->compute_delay_us = std::stoi(next_val("--compute-delay-us"));
     } else if (arg == "--uniform-priority") {
       opts->uniform_priority = true;
+    } else if (arg == "--cpu-affinity") {
+      opts->cpu_affinity = std::stoi(next_val("--cpu-affinity"));
+    } else if (arg == "--verbose") {
+      opts->verbose = true;
+    } else if (arg == "--timing") {
+      const std::string mode = next_val("--timing");
+      if (mode == "cycles") {
+        opts->timing = TimingSource::kCycles;
+      } else if (mode == "steady") {
+        opts->timing = TimingSource::kSteady;
+      } else {
+        throw std::runtime_error("timing must be cycles or steady");
+      }
+    } else if (arg == "--cpu-mhz") {
+      opts->cpu_mhz = std::stod(next_val("--cpu-mhz"));
     } else if (arg == "--help") {
       throw std::runtime_error("help");
     } else {
@@ -241,20 +368,40 @@ ibv_device *FindDevice(const std::string &name) {
   return found;
 }
 
-RdmaResources InitRdma(const Options &opts) {
+RdmaResources InitRdma(const Options &opts, ibv_port_attr *port_attr) {
   RdmaResources res{};
   ibv_device *dev = FindDevice(opts.rdma_device);
   res.ctx = ibv_open_device(dev);
   if (!res.ctx) throw std::runtime_error("ibv_open_device failed");
 
-  ibv_port_attr port_attr{};
-  if (ibv_query_port(res.ctx, opts.rdma_port, &port_attr) != 0) {
+  ibv_device_attr dev_attr{};
+  if (ibv_query_device(res.ctx, &dev_attr) != 0) {
+    throw std::runtime_error("ibv_query_device failed");
+  }
+  res.max_mr_size = dev_attr.max_mr_size;
+  res.max_qp_wr = dev_attr.max_qp_wr;
+  res.max_cqe = static_cast<uint32_t>(dev_attr.max_cqe);
+
+  if (!port_attr) {
+    throw std::runtime_error("port_attr output is null");
+  }
+  if (ibv_query_port(res.ctx, opts.rdma_port, port_attr) != 0) {
     throw std::runtime_error("ibv_query_port failed");
   }
   res.pd = ibv_alloc_pd(res.ctx);
   if (!res.pd) throw std::runtime_error("ibv_alloc_pd failed");
 
-  const size_t buf_len = opts.chunk_bytes * static_cast<size_t>(opts.chunk_count);
+  if (opts.chunk_bytes == 0 || opts.chunk_count <= 0) {
+    throw std::runtime_error("chunk_bytes and chunk_count must be positive");
+  }
+  const size_t chunk_count = static_cast<size_t>(opts.chunk_count);
+  if (opts.chunk_bytes > std::numeric_limits<size_t>::max() / chunk_count) {
+    throw std::runtime_error("buffer size overflow for chunk_bytes * chunk_count");
+  }
+  const size_t buf_len = opts.chunk_bytes * chunk_count;
+  if (res.max_mr_size != 0 && buf_len > res.max_mr_size) {
+    throw std::runtime_error("buffer size exceeds device max_mr_size");
+  }
   constexpr size_t kPageAlign = 4096;
   if (posix_memalign(&res.buf, kPageAlign, buf_len) != 0) {
     throw std::runtime_error("posix_memalign failed");
@@ -264,20 +411,29 @@ RdmaResources InitRdma(const Options &opts) {
                       IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
   if (!res.mr) throw std::runtime_error("ibv_reg_mr failed");
 
-  const int cq_depth = opts.chunk_count * 4 + 32;
-  res.cq = ibv_create_cq(res.ctx, cq_depth, nullptr, nullptr, 0);
-  if (!res.cq) throw std::runtime_error("ibv_create_cq failed");
-
   return res;
 }
 
-ibv_qp *CreatePriorityQp(ibv_pd *pd, ibv_cq *cq, uint8_t port, uint8_t priority) {
+ibv_qp *CreatePriorityQp(ibv_pd *pd, ibv_cq *cq, uint8_t port, uint8_t priority, int min_send_wr,
+                         int min_recv_wr, uint32_t max_qp_wr) {
   ibv_qp_init_attr init{};
   init.qp_type = IBV_QPT_RC;
   init.send_cq = cq;
   init.recv_cq = cq;
-  init.cap.max_send_wr = 128;
-  init.cap.max_recv_wr = 64;  // we will pre-post receives for immediate notifications
+  int desired_send_wr = std::max(128, min_send_wr);
+  int desired_recv_wr = std::max(64, min_recv_wr);  // we will pre-post receives for immediate notifications
+  if (max_qp_wr != 0) {
+    if (static_cast<uint32_t>(desired_send_wr) > max_qp_wr) {
+      throw std::runtime_error("chunk_bytes requires max_send_wr " + std::to_string(desired_send_wr) +
+                               " above device limit " + std::to_string(max_qp_wr));
+    }
+    if (static_cast<uint32_t>(desired_recv_wr) > max_qp_wr) {
+      throw std::runtime_error("chunk_count requires max_recv_wr " + std::to_string(desired_recv_wr) +
+                               " above device limit " + std::to_string(max_qp_wr));
+    }
+  }
+  init.cap.max_send_wr = desired_send_wr;
+  init.cap.max_recv_wr = desired_recv_wr;
   init.cap.max_send_sge = 1;
   init.cap.max_recv_sge = 1;
   init.sq_sig_all = 0;
@@ -322,7 +478,11 @@ bool MoveToRtr(ibv_qp *qp, const RemoteQp &remote, uint8_t port, uint8_t priorit
   }
   int flags = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
               IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
-  return ibv_modify_qp(qp, &attr, flags) == 0;
+  int rc = ibv_modify_qp(qp, &attr, flags);
+  if (rc != 0) {
+    std::cerr << "ibv_modify_qp RTR failed: errno=" << errno << " (" << std::strerror(errno) << ")\n";
+  }
+  return rc == 0;
 }
 
 bool MoveToRts(ibv_qp *qp, uint32_t psn) {
@@ -335,7 +495,11 @@ bool MoveToRts(ibv_qp *qp, uint32_t psn) {
   attr.max_rd_atomic = 1;
   int flags = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
               IBV_QP_MAX_QP_RD_ATOMIC;
-  return ibv_modify_qp(qp, &attr, flags) == 0;
+  int rc = ibv_modify_qp(qp, &attr, flags);
+  if (rc != 0) {
+    std::cerr << "ibv_modify_qp RTS failed: errno=" << errno << " (" << std::strerror(errno) << ")\n";
+  }
+  return rc == 0;
 }
 
 WireInfo BuildWire(const std::array<ibv_qp *, 7> &qps, const RdmaResources &res,
@@ -382,21 +546,49 @@ int main(int argc, char **argv) {
       std::cerr << "Usage: " << argv[0]
                 << " --next-host <host> [--oob-port 18515] [--rdma-device mlx5_0] [--rdma-port 1] "
                    "[--gid-index 0] [--rank 0] [--ranks 2] [--chunk-bytes 134217728] [--chunk-count 7] "
-                   "[--compute-delay-us 1] [--uniform-priority]\n";
+                   "[--compute-delay-us 1] [--uniform-priority] [--cpu-affinity N] [--verbose] "
+                   "[--timing cycles|steady] [--cpu-mhz MHz]\n";
       return e.what() == std::string("help") ? 0 : 1;
     }
 
-    RdmaResources res = InitRdma(opts);
+    PinThreadToCpu(opts.cpu_affinity, "main");
+    Timer timer = InitTimer(opts);
     ibv_port_attr port_attr{};
-    if (ibv_query_port(res.ctx, opts.rdma_port, &port_attr) != 0) {
-      throw std::runtime_error("ibv_query_port failed after init");
-    }
+    RdmaResources res = InitRdma(opts, &port_attr);
     ibv_gid gid{};
     if (ibv_query_gid(res.ctx, opts.rdma_port, opts.gid_index, &gid) != 0) {
       throw std::runtime_error("ibv_query_gid failed");
     }
     const bool use_gid = port_attr.link_layer == IBV_LINK_LAYER_ETHERNET;
     const uint8_t path_mtu = static_cast<uint8_t>(port_attr.active_mtu);
+    const uint64_t max_seg_bytes =
+        std::min<uint64_t>(port_attr.max_msg_sz, static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()));
+    if (max_seg_bytes == 0) {
+      throw std::runtime_error("port max_msg_sz is zero");
+    }
+    const uint64_t segments_per_chunk64 = (opts.chunk_bytes + max_seg_bytes - 1) / max_seg_bytes;
+    if (segments_per_chunk64 > static_cast<uint64_t>(std::numeric_limits<int>::max() - 1)) {
+      throw std::runtime_error("chunk_bytes too large for segment calculation");
+    }
+    const int segments_per_chunk = static_cast<int>(segments_per_chunk64);
+    const int wrs_per_chunk = segments_per_chunk + 1;
+    const int min_recv_wr = std::max(64, opts.chunk_count);
+
+    std::cout << "Device limits: max_mr_size=" << res.max_mr_size << " max_qp_wr=" << res.max_qp_wr
+              << " max_cqe=" << res.max_cqe << " port_max_msg_sz=" << port_attr.max_msg_sz << "\n";
+    std::cout << "Chunk sizing: chunk_bytes=" << opts.chunk_bytes << " segments_per_chunk=" << segments_per_chunk
+              << " wrs_per_chunk=" << wrs_per_chunk << " buf_bytes="
+              << (opts.chunk_bytes * static_cast<uint64_t>(opts.chunk_count)) << "\n";
+
+    int cq_depth = 7 * (wrs_per_chunk + min_recv_wr) + 32;
+    if (res.max_cqe != 0 && cq_depth > static_cast<int>(res.max_cqe)) {
+      if (opts.verbose) {
+        std::cerr << "Clamping CQ depth " << cq_depth << " to device max_cqe " << res.max_cqe << "\n";
+      }
+      cq_depth = static_cast<int>(res.max_cqe);
+    }
+    res.cq = ibv_create_cq(res.ctx, cq_depth, nullptr, nullptr, 0);
+    if (!res.cq) throw std::runtime_error("ibv_create_cq failed");
 
     std::array<ibv_qp *, 7> qps_rx{};
     std::array<ibv_qp *, 7> qps_tx{};
@@ -404,8 +596,8 @@ int main(int argc, char **argv) {
     std::array<uint32_t, 7> psn_tx{};
     for (int i = 0; i < 7; ++i) {
       const uint8_t prio = PriorityForIndex(i, opts);
-      qps_rx[i] = CreatePriorityQp(res.pd, res.cq, opts.rdma_port, prio);
-      qps_tx[i] = CreatePriorityQp(res.pd, res.cq, opts.rdma_port, prio);
+      qps_rx[i] = CreatePriorityQp(res.pd, res.cq, opts.rdma_port, prio, wrs_per_chunk, min_recv_wr, res.max_qp_wr);
+      qps_tx[i] = CreatePriorityQp(res.pd, res.cq, opts.rdma_port, prio, wrs_per_chunk, min_recv_wr, res.max_qp_wr);
       psn_rx[i] = FixedPsn(i, 0);
       psn_tx[i] = FixedPsn(i, 100);
     }
@@ -417,6 +609,7 @@ int main(int argc, char **argv) {
     int listen_fd = Listen(opts.oob_port);
     std::optional<WireInfo> from_prev;
     std::thread accept_thread([&]() {
+      PinThreadToCpu(opts.cpu_affinity, "accept");
       int fd = AcceptOne(listen_fd);
       WireInfo incoming{};
       if (!RecvAll(fd, &incoming, sizeof(incoming))) {
@@ -462,6 +655,11 @@ int main(int argc, char **argv) {
               << " compute_delay_us=" << opts.compute_delay_us << " uniform_priority=" << opts.uniform_priority
               << "\n";
     std::cout << "Next host=" << opts.next_host << " OOB port=" << opts.oob_port << "\n";
+    std::cout << "Timing=" << (opts.timing == TimingSource::kCycles ? "cycles" : "steady");
+    if (opts.timing == TimingSource::kCycles) {
+      std::cout << " cpu_mhz=" << timer.cpu_mhz;
+    }
+    std::cout << "\n";
     std::cout << "QPs up for priorities 0-6 (tx to next and rx from prev).\n";
     if (use_gid) {
       std::cout << "DSCP mapping (prio->dscp): ";
@@ -472,52 +670,69 @@ int main(int argc, char **argv) {
       std::cout << "\n";
     }
 
+    timer = InitTimer(opts);
     const int total_chunks = opts.chunk_count;
-    std::vector<std::chrono::steady_clock::time_point> send_ts(total_chunks);
-    std::vector<std::chrono::steady_clock::time_point> recv_ts(total_chunks);
+    std::vector<uint64_t> send_ticks(total_chunks, 0);
+    std::vector<uint64_t> recv_ticks(total_chunks, 0);
     std::vector<bool> send_set(total_chunks, false);
     std::vector<bool> recv_set(total_chunks, false);
-
-    auto start = std::chrono::steady_clock::now();
 
     auto post_chunk = [&](int chunk_idx) {
       const int prio_idx = chunk_idx % 7;
       ibv_qp *qp = qps_tx[prio_idx];
       const uint64_t offset = static_cast<uint64_t>(opts.chunk_bytes) * static_cast<uint64_t>(chunk_idx);
-      ibv_sge sge{};
-      sge.addr = reinterpret_cast<uint64_t>(res.buf) + offset;
-      sge.length = static_cast<uint32_t>(opts.chunk_bytes);
-      sge.lkey = res.mr->lkey;
+      uint64_t remaining = opts.chunk_bytes;
+      uint64_t seg_offset = 0;
+      uint64_t last_seg_offset = offset;
+      uint32_t last_seg_len = 0;
+      std::vector<ibv_sge> sges(segments_per_chunk);
+      std::vector<ibv_send_wr> wrs(wrs_per_chunk);
 
-      ibv_send_wr wr_write{};
-      wr_write.wr_id = (static_cast<uint64_t>(chunk_idx) << 32) | 0x1;
-      wr_write.next = nullptr;
-      wr_write.sg_list = &sge;
-      wr_write.num_sge = 1;
-      wr_write.opcode = IBV_WR_RDMA_WRITE;
-      wr_write.send_flags = IBV_SEND_SIGNALED;
-      wr_write.wr.rdma.remote_addr = from_next.addr + offset;
-      wr_write.wr.rdma.rkey = from_next.rkey;
+      for (int seg_idx = 0; seg_idx < segments_per_chunk; ++seg_idx) {
+        const uint32_t len = static_cast<uint32_t>(std::min<uint64_t>(remaining, max_seg_bytes));
+        sges[seg_idx].addr = reinterpret_cast<uint64_t>(res.buf) + offset + seg_offset;
+        sges[seg_idx].length = len;
+        sges[seg_idx].lkey = res.mr->lkey;
 
-      ibv_send_wr wr_imm{};
-      wr_imm.wr_id = (static_cast<uint64_t>(chunk_idx) << 32) | 0x2;
-      wr_imm.sg_list = &sge;
+        wrs[seg_idx].wr_id = (static_cast<uint64_t>(chunk_idx) << 32) | static_cast<uint32_t>(seg_idx);
+        wrs[seg_idx].next = &wrs[seg_idx + 1];
+        wrs[seg_idx].sg_list = &sges[seg_idx];
+        wrs[seg_idx].num_sge = 1;
+        wrs[seg_idx].opcode = IBV_WR_RDMA_WRITE;
+        wrs[seg_idx].send_flags = IBV_SEND_SIGNALED;
+        wrs[seg_idx].wr.rdma.remote_addr = from_next.addr + offset + seg_offset;
+        wrs[seg_idx].wr.rdma.rkey = from_next.rkey;
+
+        last_seg_offset = offset + seg_offset;
+        last_seg_len = len;
+        seg_offset += len;
+        remaining -= len;
+      }
+
+      ibv_send_wr &wr_imm = wrs[segments_per_chunk];
+      wr_imm.wr_id = (static_cast<uint64_t>(chunk_idx) << 32) | 0xffffffffu;
+      wr_imm.next = nullptr;
+      wr_imm.sg_list = &sges[segments_per_chunk - 1];
       wr_imm.num_sge = 1;
       wr_imm.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
       wr_imm.send_flags = IBV_SEND_SIGNALED;
       wr_imm.imm_data = htonl(static_cast<uint32_t>(chunk_idx));
-      wr_imm.wr.rdma.remote_addr = from_next.addr + offset;
+      wr_imm.wr.rdma.remote_addr = from_next.addr + last_seg_offset;
       wr_imm.wr.rdma.rkey = from_next.rkey;
+      if (last_seg_len == 0) {
+        throw std::runtime_error("invalid segment length for chunk " + std::to_string(chunk_idx));
+      }
 
-      wr_write.next = &wr_imm;
       ibv_send_wr *bad = nullptr;
-      if (ibv_post_send(qp, &wr_write, &bad) != 0) {
+      if (ibv_post_send(qp, &wrs[0], &bad) != 0) {
         throw std::runtime_error("ibv_post_send failed for chunk " + std::to_string(chunk_idx));
       }
-      send_ts[chunk_idx] = std::chrono::steady_clock::now();
+      send_ticks[chunk_idx] = timer.Now();
       send_set[chunk_idx] = true;
-      std::cout << "Posted chunk " << chunk_idx << " on prio_idx=" << prio_idx
-                << " offset=" << offset << " size=" << opts.chunk_bytes << " (write + write_imm)\n";
+      if (opts.verbose) {
+        std::cout << "Posted chunk " << chunk_idx << " on prio_idx=" << prio_idx << " offset=" << offset
+                  << " size=" << opts.chunk_bytes << " segments=" << segments_per_chunk << "\n";
+      }
     };
 
     int sent_chunks = 0;
@@ -542,7 +757,7 @@ int main(int argc, char **argv) {
     post_chunk(0);
     sent_chunks = 1;
 
-    const int expected_send_cqes = total_chunks * 2;  // write + write_imm per chunk.
+    const int expected_send_cqes = total_chunks * wrs_per_chunk;
     int send_cqes = 0;
 
     std::array<ibv_wc, 16> wcs{};
@@ -558,12 +773,14 @@ int main(int argc, char **argv) {
                     << " opcode=" << wc.opcode << " wr_id=0x" << wc.wr_id << std::dec << "\n";
           throw std::runtime_error("CQ error status " + std::to_string(wc.status));
         }
-        std::cout << "CQE status=" << wc.status << " opcode=" << wc.opcode << " wr_id=0x" << std::hex << wc.wr_id
-                  << " flags=0x" << wc.wc_flags << std::dec;
-        if (wc.wc_flags & IBV_WC_WITH_IMM) {
-          std::cout << " imm=" << ntohl(wc.imm_data);
+        if (opts.verbose) {
+          std::cout << "CQE status=" << wc.status << " opcode=" << wc.opcode << " wr_id=0x" << std::hex << wc.wr_id
+                    << " flags=0x" << wc.wc_flags << std::dec;
+          if (wc.wc_flags & IBV_WC_WITH_IMM) {
+            std::cout << " imm=" << ntohl(wc.imm_data);
+          }
+          std::cout << "\n";
         }
-        std::cout << "\n";
         if (wc.opcode == IBV_WC_SEND || wc.opcode == IBV_WC_RDMA_WRITE) {
           ++send_cqes;
           continue;
@@ -571,10 +788,12 @@ int main(int argc, char **argv) {
         if (wc.wc_flags & IBV_WC_WITH_IMM) {
           const uint32_t chunk_idx = ntohl(wc.imm_data);
           if (chunk_idx < static_cast<uint32_t>(total_chunks)) {
-            std::cout << "CQ recv imm for chunk " << chunk_idx << " wr_id=0x" << std::hex << wc.wr_id
-                      << " opcode=" << wc.opcode << std::dec << "\n";
+            if (opts.verbose) {
+              std::cout << "CQ recv imm for chunk " << chunk_idx << " wr_id=0x" << std::hex << wc.wr_id
+                        << " opcode=" << wc.opcode << std::dec << "\n";
+            }
             if (!recv_set[chunk_idx]) {
-              recv_ts[chunk_idx] = std::chrono::steady_clock::now();
+              recv_ticks[chunk_idx] = timer.Now();
               recv_set[chunk_idx] = true;
             }
             try_progress();
@@ -583,12 +802,11 @@ int main(int argc, char **argv) {
       }
     }
 
-    auto end = std::chrono::steady_clock::now();
-    double total_ms = std::chrono::duration<double, std::milli>(end - start).count();
+    double total_ms = static_cast<double>(timer.Now()) / timer.ticks_per_ms;
     std::cout << "Completed " << total_chunks << " chunks. Total time (ms): " << total_ms << "\n";
     for (int i = 0; i < total_chunks; ++i) {
-      double send_ms = send_set[i] ? std::chrono::duration<double, std::milli>(send_ts[i] - start).count() : -1.0;
-      double recv_ms = recv_set[i] ? std::chrono::duration<double, std::milli>(recv_ts[i] - start).count() : -1.0;
+      double send_ms = send_set[i] ? static_cast<double>(send_ticks[i]) / timer.ticks_per_ms : -1.0;
+      double recv_ms = recv_set[i] ? static_cast<double>(recv_ticks[i]) / timer.ticks_per_ms : -1.0;
       std::cout << "Chunk " << i << " send_ms=" << send_ms << " recv_ms=" << recv_ms << "\n";
     }
     return 0;

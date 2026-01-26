@@ -96,6 +96,14 @@ def launch_rank(
         args.append("--uniform-priority")
     if "gid_index" in run_cfg:
         args.extend(["--gid-index", str(run_cfg["gid_index"])])
+    if "cpu_affinity" in run_cfg:
+        args.extend(["--cpu-affinity", str(run_cfg["cpu_affinity"])])
+    if run_cfg.get("verbose"):
+        args.append("--verbose")
+    if "timing" in run_cfg:
+        args.extend(["--timing", str(run_cfg["timing"])])
+    if "cpu_mhz" in run_cfg:
+        args.extend(["--cpu-mhz", str(run_cfg["cpu_mhz"])])
     local_script = script_dir / f"rdma_ring_remote_{cfg['name']}_rank{rank}.sh"
     write_remote_script(local_script, cfg["workdir"], remote_log, args)
     helper_dest = f"{cfg['ssh_user']}@{cfg['ssh_host']}:{cfg['workdir']}/rdma_ring_remote.sh"

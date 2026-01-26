@@ -22,13 +22,15 @@ run:
   priority_levels: 7
   # chunk_bytes: 4096  # 4 KB
   # chunk_bytes: 1048576  # 1 MB
-  chunk_bytes: 16777216  # 16 MB
+  # chunk_bytes: 16777216  # 16 MB
   # chunk_bytes: 134217728  # 128 MB
+  chunk_bytes: 1073741824  # 1 GB
   chunk_count: 7
   compute_delay_us: 1
   iterations: 1
   results_dir: /tmp/rdma-prio
   gid_index: 3
+  cpu_affinity: 0
 
 # Notes:
 # - Rank i sends to (i+1) % N and receives from (i-1+N) % N.
