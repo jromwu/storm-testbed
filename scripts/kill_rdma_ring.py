@@ -6,6 +6,7 @@ import argparse
 import pathlib
 import subprocess
 import sys
+import time
 from typing import Dict, List
 
 try:
@@ -40,14 +41,16 @@ def main() -> int:
 
     for host in hosts:
         dest = f"{host['ssh_user']}@{host['ssh_host']}"
-        cmd = [
-            "ssh",
-            dest,
-            "pkill",
-            "rdma_ring",
-        ]
-        print(f"[kill] {dest}: {' '.join(cmd)}")
-        sh(cmd, check=False)
+        for attempt in range(3):
+            cmd = [
+                "ssh",
+                dest,
+                "pkill",
+                "rdma_ring",
+            ]
+            print(f"[kill] {dest} attempt={attempt + 1}: {' '.join(cmd)}")
+            sh(cmd, check=False)
+            time.sleep(0.1)
     return 0
 
 

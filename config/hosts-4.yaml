@@ -38,10 +38,13 @@ run:
   # chunk_bytes: 4096  # 4 KB
   # chunk_bytes: 1048576  # 1 MB
   # chunk_bytes: 16777216  # 16 MB
-  chunk_bytes: 134217728  # 128 MB
-  # chunk_bytes: 1073741824  # 1 GB
+  # chunk_bytes: 134217728  # 128 MB
+  chunk_bytes: 1073741824  # 1 GB
+  # chunk_bytes: 4294967296  # 4 GB
+  # chunk_bytes: 8589934592  # 8 GB
+  # chunk_bytes: 17179869184  # 16 GB
   chunk_count: 7
-  compute_delay_us: 1
+  compute_delay_us: 0
   iterations: 1
   results_dir: /tmp/rdma-prio
   gid_index: 3

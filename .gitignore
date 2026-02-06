@@ -1,4 +1,6 @@
 .venv
 *.pcap
 build/
+results*
+log*
 
